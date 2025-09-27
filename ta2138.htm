@@ -1,0 +1,149 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>a</title>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial; }
+    body { margin: 0; background:#0b0f14; color:#e8edf2; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+    .controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:12px; }
+    .controls label { font-size: 14px; opacity:.9; }
+    select, button, input[type="checkbox"] { 
+      background:#111823; color:#e8edf2; border:1px solid #253041; border-radius:10px; padding:8px 10px; 
+      font-size:14px; outline:none; 
+    }
+    select:focus, button:focus { box-shadow:0 0 0 2px #1e90ff55; }
+    button { cursor:pointer; }
+    video { width:100%; max-height:72vh; background:#000; border-radius:14px; }
+    .pill { padding:6px 10px; border-radius:999px; background:#0f1624; border:1px solid #293347; font-size:12px; opacity:.9; }
+    .spacer { flex:1 1 auto; }
+    .muted { opacity:.75; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="controls">
+      <label class="pill">Resolution</label>
+      <select id="resolutionSelect" title="Choose the video resolution">
+        <option value="auto">Auto (ABR)</option>
+      </select>
+      <label class="muted" style="display:flex;gap:8px;align-items:center">
+        <input type="checkbox" id="abrToggle" checked /> Auto adapt (ABR)
+      </label>
+      <button id="refreshBtn" title="Re-scan available variants">Refresh list</button>
+      <div class="spacer"></div>
+      <span id="status" class="muted"></span>
+    </div>
+
+    <video id="v" controls autoplay playsinline></video>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/shaka-player/4.9.3/shaka-player.compiled.js"></script>
+  <script>
+  (async () => {
+    const video = document.getElementById('v');
+    const player = new shaka.Player(video);
+
+    // === Configuration (ClearKey for your stream) ===
+    player.configure({
+      drm: { clearKeys: { "e3ce77324a3d4fa2a913b26cc1976052": "17774f82a3b9e33ea7a149596acbb20f" } },
+      // drm: { clearKeys: { "e3ce77324a3d4fa2a913b26cc1976052": "17774f82a3b9e33ea7a149596acbb20f" } },
+      abr: { enabled: true }
+    });
+
+    // UI elements
+    const sel = document.getElementById('resolutionSelect');
+    const abrToggle = document.getElementById('abrToggle');
+    const refreshBtn = document.getElementById('refreshBtn');
+    const status = document.getElementById('status');
+
+    function fmtBitrate(bps){ return (bps/1000/1000).toFixed(2) + ' Mbps'; }
+
+    function buildResolutionOptions(){
+      // Preserve current selection
+      const current = sel.value;
+      // Reset options
+      sel.innerHTML = '<option value="auto">Auto (ABR)</option>';
+
+      // Get *variant* tracks (combined audio+video) and dedupe by HEIGHT
+      const variants = player.getVariantTracks().filter(t => t.type === 'variant' && t.videoCodec);
+      // Map: height -> best variant (highest bandwidth)
+      const byHeight = new Map();
+      for(const t of variants){
+        if(!t.height) continue;
+        const keep = byHeight.get(t.height);
+        if(!keep || t.bandwidth > keep.bandwidth){ byHeight.set(t.height, t); }
+      }
+      // Sort heights ASC
+      const heights = Array.from(byHeight.keys()).sort((a,b)=>a-b);
+      for(const h of heights){
+        const t = byHeight.get(h);
+        const label = `${h}p • ${fmtBitrate(t.bandwidth)}${t.videoCodec ? ' • ' + t.videoCodec.split('.')[0] : ''}`;
+        const opt = document.createElement('option');
+        opt.value = String(h);
+        opt.textContent = label;
+        sel.appendChild(opt);
+      }
+      // Restore selection if possible
+      if([...sel.options].some(o => o.value === current)) sel.value = current; else sel.value = 'auto';
+    }
+
+    async function selectHeight(height){
+      const variants = player.getVariantTracks().filter(t => t.height === height);
+      if(variants.length === 0) return;
+      // Choose the highest bandwidth at this height
+      const best = variants.reduce((a,b)=> a.bandwidth > b.bandwidth ? a : b);
+      player.configure({ abr: { enabled: false } });
+      abrToggle.checked = false;
+      await player.selectVariantTrack(best, /* clearBuffer= */ true);
+      status.textContent = `Locked to ${height}p (${fmtBitrate(best.bandwidth)})`;
+    }
+
+    // Listen for ABR adaptation (when auto is on)
+    player.addEventListener('adaptation', () => {
+      const active = player.getVariantTracks().find(t => t.active);
+      if(active && abrToggle.checked){
+        status.textContent = `Auto: ${active.height || '?'}p (${fmtBitrate(active.bandwidth || 0)})`;
+      }
+    });
+
+    // Populate list after manifest is parsed
+    player.addEventListener('loaded', buildResolutionOptions);
+
+    // Controls wiring
+    sel.addEventListener('change', async (e) => {
+      const val = sel.value;
+      if(val === 'auto'){
+        player.configure({ abr: { enabled: true } });
+        abrToggle.checked = true;
+        const active = player.getVariantTracks().find(t => t.active);
+        status.textContent = active ? `Auto: ${active.height}p (${fmtBitrate(active.bandwidth)})` : 'Auto';
+      } else {
+        await selectHeight(parseInt(val,10));
+      }
+    });
+
+    abrToggle.addEventListener('change', () => {
+      const on = abrToggle.checked;
+      player.configure({ abr: { enabled: on } });
+      if(on){ sel.value = 'auto'; status.textContent = 'Auto'; }
+    });
+
+    refreshBtn.addEventListener('click', buildResolutionOptions);
+
+    // === Load your DASH manifest ===
+    try {
+      await player.load('https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-action/8ea6ca1108d03e03da5e61372354f5c8/index.mpd');
+      status.textContent = 'Loaded';
+      buildResolutionOptions();
+    } catch (e) {
+      console.error('Load failed', e);
+      status.textContent = 'Load failed';
+    }
+  })();
+  </script>
+</body>
+</html>
